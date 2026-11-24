@@ -16697,6 +16697,7 @@ dependencies = [
  "editor",
  "extension",
  "feature_flags",
+ "file_icons",
  "fs",
  "git",
  "git_ui_core",

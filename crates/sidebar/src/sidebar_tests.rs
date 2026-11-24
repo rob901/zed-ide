@@ -226,6 +226,12 @@ fn assert_remote_project_integration_sidebar_state(
                     terminal.metadata.title
                 );
             }
+            ListEntry::File(file) => {
+                panic!(
+                    "unexpected sidebar file while simulating remote project integration flicker: title=`{}`",
+                    file.title
+                );
+            }
         }
     }
 
@@ -1331,6 +1337,7 @@ fn visible_entries_as_strings(
                         let worktree = format_linked_worktree_chips(&terminal.worktrees);
                         format!("  {title}{worktree}{selected}")
                     }
+                    ListEntry::File(file) => format!("  [file] {}{selected}", file.title),
                 }
             })
             .collect()

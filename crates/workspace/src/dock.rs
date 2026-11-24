@@ -464,6 +464,11 @@ impl Dock {
                 if panel.is_zoomed(window, cx) {
                     workspace.zoomed = Some(panel.to_any().downgrade());
                     workspace.zoomed_position = Some(position);
+                } else if position == DockPosition::Right
+                    && workspace.zoomed_position == Some(DockPosition::Left)
+                {
+                    // A left-dock zoom is rendered next to the right dock, so
+                    // focusing the right dock keeps it.
                 } else {
                     workspace.zoomed = None;
                     workspace.zoomed_position = None;

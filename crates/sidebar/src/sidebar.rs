@@ -24,6 +24,7 @@ use agent_ui::{
 use agent_ui::{MessageEditorEvent, StateChange, thread_worktree_archive};
 use chrono::{DateTime, Utc};
 use editor::Editor;
+use file_icons::FileIcons;
 use feature_flags::{
     AgentThreadWorktreeLabel, AgentThreadWorktreeLabelFlag, FeatureFlag, FeatureFlagAppExt as _,
 };
@@ -64,11 +65,12 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
 use util::path_list::PathList;
 use util::paths::PathExt as _;
+use workspace::Panel as _;
 use workspace::{
     CloseWindow, FocusWorkspaceSidebar, MoveProjectDown, MoveProjectUp, MultiWorkspace,
     MultiWorkspaceEvent, NextProject, NextThread, Open, OpenMode, PreviousProject, PreviousThread,
     ProjectGroupKey, RemovalIntent, SaveIntent, Sidebar as WorkspaceSidebar, SidebarSide, Toast,
-    ToggleWorkspaceSidebar, Workspace, notifications::NotificationId, sidebar_side_context_menu,
+    ToggleWorkspaceSidebar, Workspace, notifications::NotificationId, Pane, sidebar_side_context_menu,
 };
 
 use git_ui_core::worktree_labels::workspace_menu_worktree_labels;
@@ -363,6 +365,19 @@ struct TerminalEntry {
     highlight_positions: Vec<usize>,
 }
 
+/// A sidebar row for an item open in a workspace's center pane, so that open
+/// files can be switched to from the sidebar just like threads and terminals.
+#[derive(Clone)]
+struct FileEntry {
+    item_id: EntityId,
+    title: SharedString,
+    tooltip: Option<SharedString>,
+    icon_path: Option<SharedString>,
+    workspace: Entity<Workspace>,
+    pane: WeakEntity<Pane>,
+    highlight_positions: Vec<usize>,
+}
+
 impl ThreadEntry {
     /// Updates this thread entry with active thread information.
     ///
@@ -395,6 +410,8 @@ enum ListEntry {
     },
     Thread(Arc<ThreadEntry>),
     Terminal(TerminalEntry),
+    /// An item (usually a file) open in one of the workspace's center panes.
+    File(FileEntry),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -414,7 +431,7 @@ impl RenameTarget {
                 Self::Terminal(terminal.metadata.terminal_id),
                 terminal.metadata.editable_title(),
             )),
-            ListEntry::ProjectHeader { .. } => None,
+            ListEntry::ProjectHeader { .. } | ListEntry::File(_) => None,
         }
     }
 }
@@ -440,7 +457,10 @@ impl ActivatableEntry {
                 metadata: terminal.metadata.clone(),
                 workspace: terminal.workspace.clone(),
             }),
-            ListEntry::ProjectHeader { .. } => None,
+            // File rows are deliberately not "activatable" here: this is used
+            // to pick a neighbor after archiving a thread or closing a terminal,
+            // and that should keep the agent panel open rather than jump to a file.
+            ListEntry::ProjectHeader { .. } | ListEntry::File(_) => None,
         }
     }
 }
@@ -450,7 +470,9 @@ impl ListEntry {
     fn session_id(&self) -> Option<&acp::SessionId> {
         match self {
             ListEntry::Thread(thread_entry) => thread_entry.metadata.session_id.as_ref(),
-            ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } => None,
+            ListEntry::Terminal(_) | ListEntry::File(_) | ListEntry::ProjectHeader { .. } => {
+                None
+            }
         }
     }
 
@@ -468,6 +490,7 @@ impl ListEntry {
                 ThreadEntryWorkspace::Open(workspace) => vec![workspace.clone()],
                 ThreadEntryWorkspace::Closed { .. } => Vec::new(),
             },
+            ListEntry::File(file) => vec![file.workspace.clone()],
             ListEntry::ProjectHeader { key, .. } => multi_workspace
                 .workspaces_for_project_group(key, cx)
                 .cloned()
@@ -512,6 +535,7 @@ enum EntryShape {
     },
     Thread(ThreadId),
     Terminal(TerminalId),
+    File(EntityId),
 }
 
 impl SidebarContents {
@@ -961,6 +985,9 @@ impl Sidebar {
                 MultiWorkspaceEvent::ActiveWorkspaceChanged { .. } => {
                     this.sync_active_entry_from_active_workspace(cx);
                     this.replace_archived_panel_thread(window, cx);
+                    if let Some(workspace) = this.active_workspace(cx) {
+                        Self::zoom_agent_panel_if_visible(&workspace, window, cx);
+                    }
                     this.schedule_update_entries(false, cx);
                 }
                 MultiWorkspaceEvent::WorkspaceAdded(workspace) => {
@@ -1151,18 +1178,34 @@ impl Sidebar {
         cx.subscribe_in(
             workspace,
             window,
-            move |this, workspace, event: &workspace::Event, window, cx| {
-                if let workspace::Event::PanelAdded(view) = event {
+            move |this, workspace, event: &workspace::Event, window, cx| match event {
+                workspace::Event::PanelAdded(view) => {
                     if let Ok(agent_panel) = view.clone().downcast::<AgentPanel>() {
                         this.subscribe_to_agent_panel(workspace, &agent_panel, window, cx);
                         this.schedule_update_entries(false, cx);
                     }
                 }
+                workspace::Event::PaneAdded(pane) => {
+                    this.collapse_agent_panel_on_pane_focus(workspace, pane, window, cx);
+                    this.schedule_update_entries(false, cx);
+                }
+                workspace::Event::PaneRemoved
+                | workspace::Event::ItemAdded { .. }
+                | workspace::Event::ItemRemoved { .. }
+                | workspace::Event::ActiveItemChanged => {
+                    this.schedule_update_entries(false, cx);
+                }
+                _ => {}
             },
         )
         .detach();
 
-        self.observe_docks(workspace, cx);
+        let panes: Vec<_> = workspace.read(cx).panes().to_vec();
+        for pane in &panes {
+            self.collapse_agent_panel_on_pane_focus(workspace, pane, window, cx);
+        }
+
+        self.observe_docks(workspace, window, cx);
 
         if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
             self.subscribe_to_agent_panel(workspace, &agent_panel, window, cx);
@@ -1390,7 +1433,12 @@ impl Sidebar {
         false
     }
 
-    fn observe_docks(&mut self, workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
+    fn observe_docks(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let docks: Vec<_> = workspace
             .read(cx)
             .all_docks()
@@ -1400,7 +1448,7 @@ impl Sidebar {
         let workspace = workspace.downgrade();
         for dock in docks {
             let workspace = workspace.clone();
-            cx.observe(&dock, move |this, _dock, cx| {
+            cx.observe_in(&dock, window, move |this, _dock, window, cx| {
                 let Some(workspace) = workspace.upgrade() else {
                     return;
                 };
@@ -1408,10 +1456,31 @@ impl Sidebar {
                     return;
                 }
 
+                Self::zoom_agent_panel_if_visible(&workspace, window, cx);
                 cx.notify();
             })
             .detach();
         }
+    }
+
+    /// Threads and terminals share the main area with open files like tabs:
+    /// whenever the agent panel is shown, zoom it so it covers the center
+    /// pane (and other docks) completely. The threads sidebar lives outside
+    /// the workspace, so it stays visible for navigation. Selecting a file
+    /// (or focusing the center pane) closes the agent panel again.
+    fn zoom_agent_panel_if_visible(workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
+        if !AgentPanel::is_visible(workspace, cx) {
+            return;
+        }
+        let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
+            return;
+        };
+        if agent_panel.read(cx).is_zoomed(window, cx) {
+            return;
+        }
+        agent_panel.update(cx, |agent_panel, cx| {
+            agent_panel.toggle_zoom(&workspace::ToggleZoom, window, cx);
+        });
     }
 
     /// Opens a new workspace for a group that has no open workspaces.
@@ -1713,6 +1782,34 @@ impl Sidebar {
             let is_collapsed = self.is_group_collapsed(group_key, cx);
             let should_load_threads = !is_collapsed || !query.is_empty();
 
+            // Items (usually files) open in the center panes of this group's
+            // open workspaces, listed in tab order.
+            let mut files: Vec<FileEntry> = Vec::new();
+            if should_load_threads {
+                let mut seen_item_ids: HashSet<EntityId> = HashSet::new();
+                for ws in group_workspaces {
+                    for pane in ws.read(cx).panes() {
+                        for item in pane.read(cx).items() {
+                            if !seen_item_ids.insert(item.item_id()) {
+                                continue;
+                            }
+                            let icon_path = item.project_path(cx).and_then(|project_path| {
+                                FileIcons::get_icon(project_path.path.as_std_path(), cx)
+                            });
+                            files.push(FileEntry {
+                                item_id: item.item_id(),
+                                title: item.tab_content_text(0, cx),
+                                tooltip: item.tab_tooltip_text(cx),
+                                icon_path,
+                                workspace: ws.clone(),
+                                pane: pane.downgrade(),
+                                highlight_positions: Vec::new(),
+                            });
+                        }
+                    }
+                }
+            }
+
             let is_active = active_workspace
                 .as_ref()
                 .is_some_and(|active| group_workspaces.contains(active));
@@ -1964,7 +2061,8 @@ impl Sidebar {
                 }
             }
 
-            let has_visible_rows = !threads.is_empty() || !terminals.is_empty();
+            let has_visible_rows =
+                !threads.is_empty() || !terminals.is_empty() || !files.is_empty();
             let has_stored_thread_rows = !should_load_threads && !has_visible_rows && {
                 let store = ThreadMetadataStore::global(cx).read(cx);
                 store
@@ -2038,7 +2136,20 @@ impl Sidebar {
                     }
                 }
 
-                if matched_threads.is_empty() && matched_terminals.is_empty() && !workspace_matched
+                let mut matched_files: Vec<FileEntry> = Vec::new();
+                for mut file in files {
+                    if let Some(positions) = fuzzy_match_positions(&query, file.title.as_ref()) {
+                        file.highlight_positions = positions;
+                        matched_files.push(file);
+                    } else if workspace_matched {
+                        matched_files.push(file);
+                    }
+                }
+
+                if matched_threads.is_empty()
+                    && matched_terminals.is_empty()
+                    && matched_files.is_empty()
+                    && !workspace_matched
                 {
                     continue;
                 }
@@ -2062,6 +2173,8 @@ impl Sidebar {
                     is_active,
                     has_threads,
                 });
+
+                entries.extend(matched_files.into_iter().map(ListEntry::File));
 
                 Self::push_entries_by_display_time(
                     &mut entries,
@@ -2112,6 +2225,8 @@ impl Sidebar {
                 if is_collapsed {
                     continue;
                 }
+
+                entries.extend(files.into_iter().map(ListEntry::File));
 
                 Self::push_entries_by_display_time(
                     &mut entries,
@@ -2240,6 +2355,7 @@ impl Sidebar {
             },
             ListEntry::Thread(thread) => EntryShape::Thread(thread.metadata.thread_id),
             ListEntry::Terminal(terminal) => EntryShape::Terminal(terminal.metadata.terminal_id),
+            ListEntry::File(file) => EntryShape::File(file.item_id),
         })
     }
 
@@ -2350,10 +2466,34 @@ impl Sidebar {
         let is_group_header_after_first =
             ix > 0 && matches!(entry, ListEntry::ProjectHeader { .. });
 
-        let is_active = self
-            .active_entry
+        // Threads and terminals live in the agent panel, files in the center
+        // pane. Only one of them occupies the main area at a time, so only
+        // highlight a thread/terminal row while the agent panel is visible,
+        // and only highlight a file row while it is hidden.
+        let active_workspace = self.active_workspace(cx);
+        let agent_panel_visible = active_workspace
             .as_ref()
-            .is_some_and(|active| active.matches_entry(entry));
+            .is_some_and(|workspace| AgentPanel::is_visible(workspace, cx));
+        let is_active = match entry {
+            ListEntry::File(file) => {
+                !agent_panel_visible
+                    && active_workspace.as_ref() == Some(&file.workspace)
+                    && file
+                        .workspace
+                        .read(cx)
+                        .active_pane()
+                        .read(cx)
+                        .active_item()
+                        .is_some_and(|item| item.item_id() == file.item_id)
+            }
+            _ => {
+                agent_panel_visible
+                    && self
+                        .active_entry
+                        .as_ref()
+                        .is_some_and(|active| active.matches_entry(entry))
+            }
+        };
 
         let rendered = match entry {
             ListEntry::ProjectHeader {
@@ -2391,6 +2531,7 @@ impl Sidebar {
             ListEntry::Terminal(terminal) => {
                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
             }
+            ListEntry::File(file) => self.render_file(ix, file, is_active, is_selected, cx),
         };
 
         if is_group_header_after_first {
@@ -3815,6 +3956,10 @@ impl Sidebar {
                 let workspace = terminal.workspace.clone();
                 self.activate_terminal_entry(metadata, workspace, false, window, cx);
             }
+            ListEntry::File(file) => {
+                let file = file.clone();
+                self.activate_file_entry(&file, window, cx);
+            }
         }
     }
 
@@ -4496,7 +4641,7 @@ impl Sidebar {
                     self.update_entries(cx);
                 }
             }
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
+            Some(ListEntry::Thread(_) | ListEntry::Terminal(_) | ListEntry::File(_)) => {
                 for i in (0..ix).rev() {
                     if let Some(ListEntry::ProjectHeader { key, .. }) = self.contents.entries.get(i)
                     {
@@ -4523,7 +4668,7 @@ impl Sidebar {
         // Find the group header for the current selection.
         let header_ix = match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { .. }) => Some(ix),
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => (0..ix).rev().find(|&i| {
+            Some(ListEntry::Thread(_) | ListEntry::Terminal(_) | ListEntry::File(_)) => (0..ix).rev().find(|&i| {
                 matches!(
                     self.contents.entries.get(i),
                     Some(ListEntry::ProjectHeader { .. })
@@ -5906,6 +6051,10 @@ impl Sidebar {
                 let workspace = terminal.workspace.clone();
                 self.close_terminal(&metadata, &workspace, window, cx);
             }
+            Some(ListEntry::File(file)) => {
+                let file = file.clone();
+                Self::close_file_entry(&file, window, cx);
+            }
             _ => {}
         }
     }
@@ -5963,7 +6112,7 @@ impl Sidebar {
                 }
                 ListEntry::Thread(thread) => Sidebar::thread_display_time(&thread.metadata),
                 ListEntry::Terminal(terminal) => terminal.metadata.created_at,
-                ListEntry::ProjectHeader { .. } => unreachable!(),
+                ListEntry::ProjectHeader { .. } | ListEntry::File(_) => unreachable!(),
             }
         }
 
@@ -6021,6 +6170,7 @@ impl Sidebar {
                     current_header_key = Some(key.clone());
                     None
                 }
+                ListEntry::File(_) => None,
                 ListEntry::Thread(thread) => {
                     if thread.draft == Some(DraftKind::Empty) {
                         return None;
@@ -6859,6 +7009,143 @@ impl Sidebar {
             .into_any_element()
     }
 
+    fn render_file(
+        &self,
+        ix: usize,
+        file: &FileEntry,
+        is_active: bool,
+        is_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = ElementId::from(SharedString::from(format!("file-{}", file.item_id)));
+        let is_hovered = self.hovered_thread_index == Some(ix);
+        let color = cx.theme().colors();
+        let button_hover_bg = color.element_background;
+        let button_active_bg = color.element_active;
+
+        let file_item = ThreadItem::new(id, file.title.clone())
+            .base_bg(color.panel_background)
+            .icon(IconName::File)
+            .when_some(file.icon_path.clone(), |this, icon_path| {
+                this.custom_icon_from_external_svg(icon_path)
+            })
+            .highlight_positions(file.highlight_positions.clone())
+            .selected(is_active)
+            .focused(is_focused)
+            .hovered(is_hovered)
+            .on_hover(cx.listener(move |this, is_hovered: &bool, _window, cx| {
+                if *is_hovered {
+                    this.hovered_thread_index = Some(ix);
+                } else if this.hovered_thread_index == Some(ix) {
+                    this.hovered_thread_index = None;
+                }
+                cx.notify();
+            }))
+            .when(is_hovered, |this| {
+                let file = file.clone();
+                this.action_slot(
+                    IconButton::new("close-file", IconName::Close)
+                        .hover_background(button_hover_bg)
+                        .active_background(button_active_bg)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Close File"))
+                        .on_click(cx.listener(move |_this, _, window, cx| {
+                            cx.stop_propagation();
+                            Self::close_file_entry(&file, window, cx);
+                        })),
+                )
+            })
+            .on_click(cx.listener({
+                let file = file.clone();
+                move |this, _, window, cx| {
+                    this.selection = None;
+                    this.activate_file_entry(&file, window, cx);
+                }
+            }));
+
+        match file.tooltip.clone() {
+            Some(tooltip) => div()
+                .id(SharedString::from(format!("file-row-{}", file.item_id)))
+                .w_full()
+                .tooltip(Tooltip::text(tooltip))
+                .child(file_item)
+                .into_any_element(),
+            None => file_item.into_any_element(),
+        }
+    }
+
+    /// Shows a center-pane item in the main area: collapses the agent panel
+    /// and activates and focuses the item in its pane.
+    fn activate_file_entry(&mut self, file: &FileEntry, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = file.workspace.clone();
+        self.activate_workspace(&workspace, window, cx);
+        let pane = file.pane.upgrade();
+        let item_id = file.item_id;
+        workspace.update(cx, |workspace, cx| {
+            workspace.close_panel::<AgentPanel>(window, cx);
+            // The item may have moved to a different pane since the sidebar
+            // was last rebuilt, so fall back to searching every pane.
+            let pane = pane
+                .filter(|pane| pane.read(cx).items().any(|item| item.item_id() == item_id))
+                .or_else(|| {
+                    workspace
+                        .panes()
+                        .iter()
+                        .find(|pane| pane.read(cx).items().any(|item| item.item_id() == item_id))
+                        .cloned()
+                });
+            if let Some(pane) = pane {
+                pane.update(cx, |pane, cx| {
+                    let index = pane.items().position(|item| item.item_id() == item_id);
+                    if let Some(index) = index {
+                        pane.activate_item(index, true, true, window, cx);
+                    }
+                });
+            }
+        });
+        self.schedule_update_entries(false, cx);
+    }
+
+    fn close_file_entry(file: &FileEntry, window: &mut Window, cx: &mut App) {
+        let Some(pane) = file.pane.upgrade() else {
+            return;
+        };
+        let item_id = file.item_id;
+        pane.update(cx, |pane, cx| {
+            pane.close_item_by_id(item_id, SaveIntent::Close, window, cx)
+                .detach_and_log_err(cx);
+        });
+    }
+
+    /// Collapses the agent panel whenever the user moves focus into one of
+    /// the workspace's center panes (for example by double-clicking a file in
+    /// the project panel), so files and threads share the main area like tabs.
+    fn collapse_agent_panel_on_pane_focus(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        pane: &Entity<Pane>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = workspace.downgrade();
+        let focus_handle = pane.read(cx).focus_handle(cx);
+        cx.on_focus_in(&focus_handle, window, move |this, window, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return;
+            };
+            if !this.is_active_workspace(&workspace, cx) || !AgentPanel::is_visible(&workspace, cx)
+            {
+                return;
+            }
+            workspace.update(cx, |workspace, cx| {
+                workspace.close_panel::<AgentPanel>(window, cx);
+            });
+            this.schedule_update_entries(false, cx);
+        })
+        .detach();
+    }
+
     fn render_filter_input(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .min_w_0()
@@ -7251,7 +7538,7 @@ impl Sidebar {
         let ix = self.selection?;
         match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { key, .. }) => Some(key.clone()),
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
+            Some(ListEntry::Thread(_) | ListEntry::Terminal(_) | ListEntry::File(_)) => {
                 (0..ix)
                     .rev()
                     .find_map(|i| match self.contents.entries.get(i) {
@@ -7443,7 +7730,7 @@ impl Sidebar {
                 let workspace = terminal.workspace.clone();
                 self.activate_terminal_entry(metadata, workspace, true, window, cx);
             }
-            ListEntry::ProjectHeader { .. } => {}
+            ListEntry::ProjectHeader { .. } | ListEntry::File(_) => {}
         }
     }
 

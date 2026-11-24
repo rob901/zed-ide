@@ -4729,7 +4729,9 @@ impl Workspace {
         let mut focus_center = false;
         let mut reveal_dock = false;
 
-        let other_is_zoomed = self.zoomed.is_some() && self.zoomed_position != Some(dock_side);
+        let other_is_zoomed = self.zoomed.is_some()
+            && self.zoomed_position != Some(dock_side)
+            && !(self.zoom_renders_in_center() && dock_side == DockPosition::Right);
         let was_visible = self.is_dock_at_position_open(dock_side, cx) && !other_is_zoomed;
 
         if let Some(panel) = self.dock_at_position(dock_side).read(cx).active_panel() {
@@ -5061,6 +5063,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A left-dock zoom renders in the center area, next to the right dock,
+        // so revealing the right dock doesn't need to dismiss it.
+        let keep_left_zoom = self.zoom_renders_in_center()
+            && dock_to_reveal == Some(DockPosition::Right);
+
         // If a center pane is zoomed, unzoom it.
         for pane in &self.panes {
             if pane != &self.active_pane || dock_to_reveal.is_some() {
@@ -5073,6 +5080,7 @@ impl Workspace {
         for dock in self.all_docks() {
             dock.update(cx, |dock, cx| {
                 if Some(dock.position()) != dock_to_reveal
+                    && !(keep_left_zoom && dock.position() == DockPosition::Left)
                     && let Some(panel) = dock.active_panel()
                     && panel.is_zoomed(window, cx)
                 {
@@ -5087,7 +5095,7 @@ impl Workspace {
                 .update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx))
         }
 
-        if self.zoomed_position != dock_to_reveal {
+        if self.zoomed_position != dock_to_reveal && !keep_left_zoom {
             self.zoomed = None;
             self.zoomed_position = None;
             cx.emit(Event::ZoomChanged);
@@ -6304,13 +6312,23 @@ impl Workspace {
             }
         }
 
+        // A left-dock zoom (rendered in the center area) survives focus moving
+        // to a pane inside the left dock itself or inside the right dock.
+        let keep_left_zoom = self.zoom_renders_in_center()
+            && matches!(
+                dock_to_preserve,
+                Some(DockPosition::Left) | Some(DockPosition::Right)
+            );
+
         self.dismiss_zoomed_items_to_reveal(dock_to_preserve, window, cx);
-        if pane.read(cx).is_zoomed() {
-            self.zoomed = Some(pane.downgrade().into());
-        } else {
-            self.zoomed = None;
+        if !keep_left_zoom {
+            if pane.read(cx).is_zoomed() {
+                self.zoomed = Some(pane.downgrade().into());
+            } else {
+                self.zoomed = None;
+            }
+            self.zoomed_position = None;
         }
-        self.zoomed_position = None;
         cx.emit(Event::ZoomChanged);
         self.update_active_view_for_followers(window, cx);
         pane.update(cx, |pane, _| {
@@ -9287,13 +9305,30 @@ impl Workspace {
                 this.track_focus(&self.region_focus_handles.editor)
             })
             .size_full()
-            .child(self.center.render(
-                self.zoomed.as_ref(),
-                self.maximized_pane.as_ref(),
-                render_cx,
-                window,
-                cx,
-            ))
+            .map(|this| match self.zoomed_view_in_center() {
+                Some(zoomed_view) => this.child(zoomed_view),
+                None => this.child(self.center.render(
+                    self.zoomed.as_ref(),
+                    self.maximized_pane.as_ref(),
+                    render_cx,
+                    window,
+                    cx,
+                )),
+            })
+    }
+
+    /// A panel zoomed from the left dock (e.g. the agent panel) is rendered in
+    /// place of the center panes instead of as an overlay, so the right dock
+    /// stays visible and usable alongside it.
+    fn zoom_renders_in_center(&self) -> bool {
+        self.zoomed_position == Some(DockPosition::Left)
+    }
+
+    fn zoomed_view_in_center(&self) -> Option<AnyView> {
+        if !self.zoom_renders_in_center() {
+            return None;
+        }
+        self.zoomed.as_ref()?.upgrade()
     }
 
     pub fn for_window(window: &Window, cx: &App) -> Option<Entity<Workspace>> {
@@ -10542,6 +10577,9 @@ impl Render for Workspace {
                                 }
                             })
                             .children(self.zoomed.as_ref().and_then(|view| {
+                                if self.zoom_renders_in_center() {
+                                    return None;
+                                }
                                 let zoomed_view = view.upgrade()?;
                                 let zoomed_element = match zoomed_paddings {
                                     (None, None) => zoomed_view.into_any_element(),
